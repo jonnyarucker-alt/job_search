@@ -280,7 +280,91 @@ def parse_message(msg: email.message.Message) -> dict | None:
     return parsed
 
 
-# ----------------------------- main -----------------------------
+# ----------------------------- shared ingest -----------------------------
+
+def _since_ok(date_applied: str, since: date | None) -> bool:
+    if not since or not date_applied:
+        return True
+    try:
+        return datetime.strptime(date_applied, "%Y-%m-%d").date() >= since
+    except Exception:
+        return True
+
+
+def ingest_messages(messages, since: date | None = None,
+                    dry_run: bool = False, limit: int | None = None) -> dict:
+    """Parse an iterable of email.message.Message, upsert application entries into
+    the tracker, and log unparseable-but-relevant ones for review.
+
+    Shared by both the IMAP scanner and the Takeout/mbox importer. Returns a stats
+    dict. `since` filters by the message date (pass None if the source already
+    filtered, e.g. IMAP SEARCH SINCE).
+    """
+    rows = tracker.load()
+    added = merged = processed = 0
+    review: list[dict] = []
+
+    for msg in messages:
+        if limit and processed >= limit:
+            break
+        processed += 1
+        parsed = parse_message(msg)
+        if parsed is None:
+            continue
+        if not _since_ok(parsed["date_applied"], since):
+            continue
+
+        if not parsed["company"]:
+            review.append({k: parsed[k] for k in ("subject", "from", "source", "date_applied")})
+            continue
+
+        entry = {
+            "company": parsed["company"],
+            "role": parsed["role"],
+            "source": parsed["source"],
+            "url": "",
+            "date_applied": parsed["date_applied"],
+            "status": "applied",
+            "location": "",
+            "no_travel": "",
+            "source_detail": f"email:{parsed['sender_email']}",
+            "notes": f"subject: {parsed['subject']}",
+        }
+        if dry_run:
+            tag = "role" if entry["role"] else "company-only"
+            print(f"  [{tag}] {entry['company']} :: {entry['role'] or '(unknown role)'}  <{parsed['source']}>")
+            continue
+
+        rows, created = tracker.upsert(entry, rows)
+        added += created
+        merged += (0 if created else 1)
+
+    if not dry_run:
+        tracker.save(rows)
+        REVIEW_FILE.write_text(json.dumps(review, indent=2), encoding="utf-8")
+
+    stats = {"added": added, "merged": merged, "processed": processed,
+             "review": review, "total": len(rows)}
+
+    print("\n" + "=" * 60)
+    if dry_run:
+        print(f"Dry run complete. Processed {processed}; "
+              f"{len(review)} relevant emails could not be parsed to a company.")
+    else:
+        print(f"Applications added: {added} | merged into existing: {merged}")
+        print(f"Total tracked now: {len(rows)}")
+        print(f"Needs review (relevant but unparsed): {len(review)} -> {REVIEW_FILE.name}")
+    return stats
+
+
+# ----------------------------- main (IMAP) -----------------------------
+
+def _imap_messages(imap: imaplib.IMAP4_SSL, uids: list[bytes]):
+    for uid in uids:
+        msg = fetch_headers(imap, uid)
+        if msg is not None:
+            yield msg
+
 
 def run(since: date, dry_run: bool, limit: int | None) -> None:
     env = load_env()
@@ -297,54 +381,8 @@ def run(since: date, dry_run: bool, limit: int | None) -> None:
             uids = uids[-limit:]
         print(f"Scanning {len(uids)} candidate emails in '{folder}' since {since.isoformat()} ...")
 
-        rows = tracker.load()
-        added = merged = 0
-        review: list[dict] = []
-
-        for i, uid in enumerate(uids, 1):
-            msg = fetch_headers(imap, uid)
-            if msg is None:
-                continue
-            parsed = parse_message(msg)
-            if parsed is None:
-                continue
-
-            if not parsed["company"]:
-                review.append({k: parsed[k] for k in ("subject", "from", "source", "date_applied")})
-                continue
-
-            entry = {
-                "company": parsed["company"],
-                "role": parsed["role"],
-                "source": parsed["source"],
-                "url": "",
-                "date_applied": parsed["date_applied"],
-                "status": "applied",
-                "location": "",
-                "no_travel": "",
-                "source_detail": f"email:{parsed['sender_email']}",
-                "notes": f"subject: {parsed['subject']}",
-            }
-            if dry_run:
-                tag = "role" if entry["role"] else "company-only"
-                print(f"  [{tag}] {entry['company']} :: {entry['role'] or '(unknown role)'}  <{parsed['source']}>")
-                continue
-
-            rows, created = tracker.upsert(entry, rows)
-            added += created
-            merged += (0 if created else 1)
-
-        if not dry_run:
-            tracker.save(rows)
-            REVIEW_FILE.write_text(json.dumps(review, indent=2), encoding="utf-8")
-
-        print("\n" + "=" * 60)
-        if dry_run:
-            print(f"Dry run complete. {len(review)} relevant emails could not be parsed to a company.")
-        else:
-            print(f"Applications added: {added} | merged into existing: {merged}")
-            print(f"Total tracked now: {len(rows)}")
-            print(f"Needs review (relevant but unparsed): {len(review)} -> {REVIEW_FILE.name}")
+        # IMAP SEARCH already filtered by SINCE, so pass since=None here.
+        ingest_messages(_imap_messages(imap, uids), since=None, dry_run=dry_run)
     finally:
         try:
             imap.close()

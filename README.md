@@ -7,7 +7,7 @@ Built as a personal automation project; shared here as a portfolio piece.
 ## What it does
 
 1. **Multi-ATS job scraping** - Discovers and pulls open postings from Greenhouse, Lever, Ashby, and Workday job boards, then filters them by role keywords (e.g. technical accounting, external reporting, controller).
-2. **Email backfill** - Connects to Gmail over IMAP and detects application-confirmation emails from ATS platforms, LinkedIn, Glassdoor, and recruiters to reconstruct everywhere you have already applied - regardless of the channel you applied through.
+2. **Email backfill** - Detects application-confirmation emails from ATS platforms, LinkedIn, Glassdoor, and recruiters to reconstruct everywhere you have already applied - regardless of the channel you applied through. Read either live over Gmail IMAP (`email_scan.py`) or from a credential-free Google Takeout `.mbox` export (`mbox_scan.py`).
 3. **Central application tracker** - A single source-of-truth store that merges scraped openings, email-detected applications, and manual entries, deduped by company + role.
 4. **Cross-reference + flagging** - Tags every scraped opening as *already applied* or *not yet applied*, so the output is an actionable shortlist.
 5. **Excel reporting** - Exports an `.xlsx` workbook with an "Open Roles" sheet (not-yet-applied rows highlighted) and a "My Applications" sheet.
@@ -38,6 +38,7 @@ The email scanner and tracker are plain Python modules over the standard library
 scraper/
 ├── job_scraper.py     # Multi-ATS scraper + keyword filter + cross-reference
 ├── email_scan.py      # Gmail IMAP backfill -> application tracker
+├── mbox_scan.py       # Google Takeout (.mbox) backfill -> application tracker (no credentials)
 ├── tracker.py         # Central applications store (load / upsert / dedup / lookup)
 ├── export_excel.py    # Excel (.xlsx) report generation
 ├── companies.json     # Target companies + role keywords (config)
@@ -59,6 +60,10 @@ To enable the email backfill, use a Gmail **App Password** (not your account pas
 2. Create an App Password at <https://myaccount.google.com/apppasswords> (requires 2-Step Verification).
 3. Put your address and the 16-character app password into `scraper/.env`.
 
+If App Passwords aren't available on your account, skip the IMAP setup entirely and use the
+credential-free **Google Takeout** route instead: export your mail at <https://takeout.google.com>
+(select only "Mail"), unzip it, and run `mbox_scan.py --mbox <file>.mbox`.
+
 ## Usage
 
 ```bash
@@ -72,6 +77,9 @@ python scraper/job_scraper.py --only Ramp Stripe # specific companies
 
 # Backfill application history from email (reads your inbox locally)
 python scraper/email_scan.py --since 2024-01-01
+
+# ...or backfill from a Google Takeout .mbox export (no app password needed)
+python scraper/mbox_scan.py --mbox "All mail.mbox" --since 2024-01-01
 
 # Export the current state to Excel
 python scraper/export_excel.py

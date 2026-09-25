@@ -10,6 +10,7 @@ and Excel reports. Seed list mirrors `../career_context/target_companies.md`.
 - `job_scraper.py` - multi-ATS scraper + keyword filter + cross-reference against the tracker.
 - `tracker.py` - central application store (`data/applications.csv`); load / upsert / dedup / has-applied lookup.
 - `email_scan.py` - Gmail IMAP backfill: detects application-confirmation emails and upserts them into the tracker.
+- `mbox_scan.py` - Google Takeout (.mbox) backfill: same detection, no credentials/app password needed.
 - `export_excel.py` - writes the `.xlsx` workbook (Open Roles + My Applications).
 
 ## Run
@@ -22,8 +23,9 @@ python job_scraper.py --group 1 2 3   # only Pipeline A groups
 python job_scraper.py --no-travel     # only no-travel-tagged companies
 python job_scraper.py --only Ramp Stripe Anduril
 
-python email_scan.py --since 2024-01-01   # backfill applied-to roles from Gmail
+python email_scan.py --since 2024-01-01   # backfill applied-to roles from Gmail (IMAP)
 python email_scan.py --dry-run            # preview parsing without writing
+python mbox_scan.py --mbox mail.mbox      # backfill from a Google Takeout export (no password)
 python tracker.py list                    # show the central tracker
 python export_excel.py                    # export the tracker to Excel
 ```
@@ -38,9 +40,16 @@ Standard library only, except `openpyxl` for the Excel export (`pip install -r .
 
 ## Email backfill setup
 
-The scanner reads your inbox locally using a Gmail **App Password** (never your real password).
-Copy `.env.example` to `.env` and fill in `GMAIL_ADDRESS` / `GMAIL_APP_PASSWORD` (see the root README
-for the exact steps). `.env`, `data/`, and `reports/` are all gitignored.
+Two ways to backfill your application history; both run locally and reuse the same parser:
+
+- **IMAP (`email_scan.py`)** - reads your inbox using a Gmail **App Password** (never your real
+  password). Copy `.env.example` to `.env` and fill in `GMAIL_ADDRESS` / `GMAIL_APP_PASSWORD`.
+  Requires 2-Step Verification to be enabled (that's what makes app passwords available).
+- **Takeout / mbox (`mbox_scan.py`)** - if app passwords aren't available on your account, export
+  your mail at <https://takeout.google.com> (select only "Mail"), unzip, and point `--mbox` at the
+  `.mbox` file. No credentials needed.
+
+`.env`, `data/`, and `reports/` are all gitignored.
 
 ## Two pipelines
 
