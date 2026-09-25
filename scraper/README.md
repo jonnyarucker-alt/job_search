@@ -9,9 +9,10 @@ and Excel reports. Seed list mirrors `../career_context/target_companies.md`.
 
 - `job_scraper.py` - multi-ATS scraper + keyword filter + cross-reference against the tracker.
 - `tracker.py` - central application store (`data/applications.csv`); load / upsert / dedup / has-applied lookup.
-- `email_scan.py` - Gmail IMAP backfill: detects application-confirmation emails and upserts them into the tracker.
+- `email_scan.py` - Gmail IMAP backfill: detects application-confirmation and status-change emails, extracts company/role/location/URL/recruiter from the body, and upserts into the tracker.
 - `mbox_scan.py` - Google Takeout (.mbox) backfill: same detection, no credentials/app password needed.
-- `export_excel.py` - writes the `.xlsx` workbook (Open Roles + My Applications).
+- `recruiters.py` - recruiter/contact store (`data/recruiters.csv`), auto-seeded from human email senders plus manual entries.
+- `export_excel.py` - writes the `.xlsx` workbook (Open Roles + My Applications + Recruiters).
 
 ## Run
 
@@ -27,8 +28,24 @@ python email_scan.py --since 2024-01-01   # backfill applied-to roles from Gmail
 python email_scan.py --dry-run            # preview parsing without writing
 python mbox_scan.py --mbox mail.mbox      # backfill from a Google Takeout export (no password)
 python tracker.py list                    # show the central tracker
-python export_excel.py                    # export the tracker to Excel
+python recruiters.py list                 # show tracked recruiters/contacts
+python recruiters.py seed-defaults        # add known contacts
+python export_excel.py                    # export tracker + recruiters to Excel
 ```
+
+## Tracker fields & statuses
+
+Each application row carries: `company, role, source, sources` (all channels it was
+seen from), `status, date_applied, last_update, location, salary, recruiter,
+hiring_manager, url` (posting), `email_link` (Gmail deep link), `message_id,
+no_travel, source_detail, notes, body` (full email text).
+
+- **Statuses:** `applied -> viewed/reviewed -> interviewing -> offer` (or `rejected`),
+  advanced automatically when a later status-change email is detected.
+- **Dedup:** entries merge on same company + compatible role within a few days
+  (collapsing e.g. a LinkedIn and a Greenhouse confirmation for one application);
+  status-change emails attach to the prior application regardless of date. Sources
+  and message-ids are aggregated on merge.
 
 Outputs:
 - `reports/report_<timestamp>.md` - action list (not-yet-applied), NEW postings, and already-applied.

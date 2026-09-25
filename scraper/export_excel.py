@@ -23,6 +23,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 import tracker
+import recruiters
 
 HERE = Path(__file__).parent
 REPORTS = HERE / "reports"
@@ -101,16 +102,38 @@ def _sheet_applications(wb: Workbook, applications: list[dict]) -> None:
     headers = [h.replace("_", " ").title() for h in tracker.FIELDS]
     ws.append(headers)
 
+    url_col = tracker.FIELDS.index("url") + 1
+    link_col = tracker.FIELDS.index("email_link") + 1
+    body_col = tracker.FIELDS.index("body") + 1
+
     for r in sorted(applications, key=lambda x: (str(x.get("company", "")).lower(),
                                                  str(x.get("role", "")).lower())):
         ws.append([r.get(fld, "") for fld in tracker.FIELDS])
-        url = r.get("url")
-        if url:
-            col = tracker.FIELDS.index("url") + 1
-            cell = ws.cell(row=ws.max_row, column=col)
-            cell.hyperlink = url
-            cell.font = LINK_FONT
+        row_i = ws.max_row
+        if r.get("url"):
+            c = ws.cell(row=row_i, column=url_col)
+            c.hyperlink = r["url"]
+            c.font = LINK_FONT
+        if r.get("email_link"):
+            c = ws.cell(row=row_i, column=link_col)
+            c.value = "open email"       # the raw Gmail search URL is long/ugly
+            c.hyperlink = r["email_link"]
+            c.font = LINK_FONT
 
+    _style_header(ws, len(headers))
+    _autosize(ws)
+    # Keep the long free-text columns from blowing out the layout.
+    ws.column_dimensions[get_column_letter(body_col)].width = 60
+    ws.column_dimensions[get_column_letter(tracker.FIELDS.index("message_id") + 1)].width = 22
+    ws.column_dimensions[get_column_letter(tracker.FIELDS.index("notes") + 1)].width = 40
+
+
+def _sheet_recruiters(wb: Workbook, recruiter_rows: list[dict]) -> None:
+    ws = wb.create_sheet("Recruiters")
+    headers = [h.replace("_", " ").title() for h in recruiters.FIELDS]
+    ws.append(headers)
+    for r in sorted(recruiter_rows, key=lambda x: str(x.get("name", "")).lower()):
+        ws.append([r.get(fld, "") for fld in recruiters.FIELDS])
     _style_header(ws, len(headers))
     _autosize(ws)
 
@@ -126,6 +149,7 @@ def build(matches: list[dict], applications: list[dict] | None,
     wb.remove(wb.active)  # drop default sheet
     _sheet_open_roles(wb, matches)
     _sheet_applications(wb, applications)
+    _sheet_recruiters(wb, recruiters.load())
 
     out_dir.mkdir(exist_ok=True)
     path = out_dir / f"report_{stamp}.xlsx"
@@ -144,6 +168,7 @@ def main():
     wb.remove(wb.active)
     _sheet_open_roles(wb, [])  # no scrape in standalone mode
     _sheet_applications(wb, applications)
+    _sheet_recruiters(wb, recruiters.load())
 
     if args.out:
         path = Path(args.out)

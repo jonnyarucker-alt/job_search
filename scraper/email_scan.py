@@ -35,6 +35,7 @@ from email.utils import parsedate_to_datetime, parseaddr
 from pathlib import Path
 
 import tracker
+import recruiters
 
 HERE = Path(__file__).parent
 ENV_FILE = HERE / ".env"
@@ -87,24 +88,51 @@ SUBJECT_SIGNALS = [
     "you applied to",
     "you've applied to",
     "thank you for your interest in",
+    # status-change / follow-up signals
+    "update on your application",
+    "information about your application",
+    "your application was viewed",
+    "regarding your application",
 ]
 
 # Ordered subject regexes. Named groups: role, company. First match wins.
+# Subjects are whitespace-normalized before matching (folded headers collapsed).
+_SEP = r"[-–—:]"
 SUBJECT_PATTERNS: list[re.Pattern] = [
-    # "Your application for <role> at <company>"
-    re.compile(r"your application for (?P<role>.+?) at (?P<company>.+)$", re.I),
+    # --- status-change subjects (still carry role + company) ---
+    # "Update on your application for the <role> position at <company>"
+    re.compile(r"update on your application for(?: the)? (?P<role>.+?)(?: position| role)? at (?P<company>.+)$", re.I),
+    # "Information about your application to <company> - <role>"
+    re.compile(rf"information about your application to (?P<company>.+?)\s*{_SEP}\s*(?P<role>.+)$", re.I),
+    # --- role + company ---
+    # "Your application for the position <role> at <company> has been received"
+    re.compile(r"your application for the position (?P<role>.+?) at (?P<company>.+?)(?: has been received)?$", re.I),
+    # "Your application for our <role> role at <company>"  (Stripe)
+    re.compile(r"your application for our (?P<role>.+?) role at (?P<company>.+)$", re.I),
+    # "Your application (for|to) <role> at <company>"
+    re.compile(r"your application (?:for|to) (?P<role>.+?) at (?P<company>.+)$", re.I),
+    # "applying to the <role> position at <company>"  (New Relic)
+    re.compile(r"applying to the (?P<role>.+?) position at (?P<company>.+)$", re.I),
+    # "applying to <company> for the role of <role>"  (Intercom)
+    re.compile(r"applying to (?P<company>.+?) for the role of (?P<role>.+)$", re.I),
     # "Application received: <role> at <company>"  /  "Application submitted: <role> at <company>"
     re.compile(r"application (?:received|submitted)[:\-\s]+(?P<role>.+?) at (?P<company>.+)$", re.I),
     # "We received your application for <role> at <company>"
     re.compile(r"received your application for (?P<role>.+?) at (?P<company>.+)$", re.I),
-    # "We received your application for <role>"
-    re.compile(r"received your application for (?P<role>.+)$", re.I),
+    # "We received your application - <role> at <company>"  (em-dash / colon, Akido)
+    re.compile(rf"received your application\s*{_SEP}\s*(?P<role>.+?) at (?P<company>.+)$", re.I),
     # "<role> at <company> - application received/submitted"
     re.compile(r"(?P<role>.+?) at (?P<company>.+?)\s*[-|:]\s*application (?:received|submitted)", re.I),
-    # "Your application was sent to <company>"  (LinkedIn)
-    re.compile(r"your application was sent to (?P<company>.+)$", re.I),
     # "You applied to <role> at <company>"  (Indeed)
     re.compile(r"you(?:'ve| have)? applied (?:to|for) (?P<role>.+?) at (?P<company>.+)$", re.I),
+    # --- role only ---
+    # "We received your application for <role>"
+    re.compile(r"received your application for (?P<role>.+)$", re.I),
+    # "Application Received for <role>"  (company comes from sender)
+    re.compile(r"application received for (?P<role>.+)$", re.I),
+    # --- company only ---
+    # "Your application was sent to <company>"  (LinkedIn)
+    re.compile(r"your application was sent to (?P<company>.+)$", re.I),
     # "You applied to <company>"
     re.compile(r"you(?:'ve| have)? applied to (?P<company>.+)$", re.I),
     # "Your application to <company>"
@@ -206,15 +234,141 @@ def _clean_role(text: str | None) -> str:
     return r if 1 < len(r) <= 70 else ""
 
 
-def _linkedin_body(body: str) -> tuple[str, str]:
-    """LinkedIn 'application sent' emails: '<company>\\n<role>\\n<company>\\n<location>'."""
+def _linkedin_fields(body: str) -> tuple[str, str, str]:
+    """LinkedIn 'application sent' emails lay out:
+    '<company>\\n<role>\\n<company>\\n<location>\\nView job: <url>'.
+    Returns (role, company, location)."""
     m = re.search(r"your application was sent to (?P<company>.+)", body, re.I)
     if not m:
-        return "", ""
+        return "", "", ""
     company = _clean(m.group("company"))
     lines = [ln.strip() for ln in body[m.end():].splitlines() if ln.strip()]
     role = _clean_role(lines[0]) if lines else ""
-    return role, company
+    location = ""
+    for ln in lines[1:4]:
+        if _looks_like_location(ln):
+            location = _clean(ln)
+            break
+    return role, company, location
+
+
+# ----------------------------- status + field extractors -----------------------------
+
+# Precedence: offer > rejected > interviewing > reviewed. Checked against subject+body.
+_OFFER_SIGNALS = ["pleased to offer", "offer of employment", "we would like to offer",
+                  "extend an offer", "excited to extend an offer"]
+_REJECT_SIGNALS = ["unfortunately", "not moving forward", "will not be moving forward",
+                   "decided not to move forward", "position has been filled",
+                   "pursue other candidates", "will not be proceeding",
+                   "no longer under consideration", "regret to inform",
+                   "decided to move forward with other"]
+_INTERVIEW_SIGNALS = ["schedule an interview", "invite you to interview", "like to interview",
+                      "would like to schedule", "phone screen", "set up a call",
+                      "invitation to interview", "move forward with an interview",
+                      "schedule a call", "like to speak with you"]
+_REVIEWED_SIGNALS = ["update on your application", "information about your application",
+                     "your application was viewed", "has been reviewed",
+                     "we have reviewed", "after reviewing your application",
+                     "reviewed your application", "regarding your application"]
+
+
+def detect_status(subject: str, body: str) -> str:
+    text = f"{subject}\n{body}".lower()
+    if any(s in text for s in _OFFER_SIGNALS):
+        return "offer"
+    if any(s in text for s in _REJECT_SIGNALS):
+        return "rejected"
+    if any(s in text for s in _INTERVIEW_SIGNALS):
+        return "interviewing"
+    if any(s in text for s in _REVIEWED_SIGNALS):
+        return "reviewed"
+    return "applied"
+
+
+_US_STATE = (r"AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|"
+             r"MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|DC")
+_LOCATION_RE = re.compile(rf"^[A-Z][A-Za-z .'-]+,\s*(?:{_US_STATE})\b", re.I)
+
+
+def _looks_like_location(s: str) -> bool:
+    s = s.strip()
+    if not s or len(s) > 60:
+        return False
+    if re.search(r"\bremote\b|\bhybrid\b|\bon-?site\b", s, re.I):
+        return True
+    return bool(_LOCATION_RE.match(s))
+
+
+def extract_location(body: str) -> str:
+    m = re.search(r"(?:^|\n)\s*Location[:\s]+(?P<loc>.+)", body, re.I)
+    if m:
+        loc = _clean(m.group("loc").splitlines()[0])
+        if loc:
+            return loc
+    for ln in body.splitlines():
+        if _looks_like_location(ln):
+            return _clean(ln)
+    return ""
+
+
+_URL_RE = re.compile(r"https?://[^\s)\]\"'<>]+")
+_URL_SKIP = ("unsubscribe", "optout", "opt-out", "/privacy", "notification-settings",
+             "email_preferences", "manage-preferences", "help.", "support.", "policy")
+_URL_PREFER = ("job", "posting", "career", "greenhouse", "lever.co", "ashbyhq",
+               "myworkday", "smartrecruiters", "icims", "workable", "jobvite")
+
+
+def extract_posting_url(body: str, source: str) -> str:
+    m = re.search(r"view job:?\s*(https?://\S+)", body, re.I)
+    if m:
+        return m.group(1).rstrip(".,)")
+    candidates = [u.rstrip(".,)") for u in _URL_RE.findall(body)]
+    candidates = [u for u in candidates if not any(s in u.lower() for s in _URL_SKIP)]
+    for u in candidates:
+        if any(p in u.lower() for p in _URL_PREFER):
+            return u
+    return candidates[0] if candidates else ""
+
+
+_SALARY_RE = re.compile(
+    r"\$\s?\d{2,3}(?:,\d{3})+(?:\s?[-–—to]+\s?\$?\s?\d{2,3}(?:,\d{3})+)?"
+    r"|\$\s?\d{2,3}\s?k(?:\s?[-–—to]+\s?\$?\s?\d{2,3}\s?k)?", re.I)
+
+
+def extract_salary(body: str) -> str:
+    m = _SALARY_RE.search(body)
+    return re.sub(r"\s+", " ", m.group(0)).strip() if m else ""
+
+
+_PERSON_RE = re.compile(r"^[A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,2}$")
+_NON_PERSON = re.compile(
+    r"\b(team|talent|recruit|careers?|hiring|hr|human resources|people|"
+    r"no[- ]?reply|do[- ]?not[- ]?reply|notifications?|jobs?|support|info)\b", re.I)
+
+
+def is_person_sender(disp_name: str, sender_email: str) -> bool:
+    local = sender_email.split("@", 1)[0].lower()
+    if _NON_PERSON.search(disp_name) or _NON_PERSON.search(local):
+        return False
+    return bool(_PERSON_RE.match(disp_name.strip()))
+
+
+def extract_recruiter(disp_name: str, sender_email: str, body: str) -> str:
+    if is_person_sender(disp_name, sender_email):
+        return disp_name.strip()
+    # signature: "Best,\n<First Last>"
+    m = re.search(r"(?:best|regards|sincerely|thanks|cheers|warmly)[,!]?\s*\n+"
+                  r"(?P<name>[A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,2})", body, re.I)
+    if m:
+        name = m.group("name").strip()
+        if not _NON_PERSON.search(name):
+            return name
+    return ""
+
+
+def gmail_link(message_id: str) -> str:
+    mid = (message_id or "").strip().strip("<>").strip()
+    return f"https://mail.google.com/mail/u/0/#search/rfc822msgid:{mid}" if mid else ""
 
 
 # ----------------------------- env / connect -----------------------------
@@ -339,7 +493,7 @@ def source_from_sender(sender_email: str) -> str | None:
 
 def parse_message(msg: email.message.Message) -> dict | None:
     """Return a parsed application dict, or None if it doesn't look like one."""
-    subject = _decode(msg.get("Subject"))
+    subject = re.sub(r"\s+", " ", _decode(msg.get("Subject"))).strip()  # collapse folded headers
     from_raw = _decode(msg.get("From"))
     disp_name, sender_email = parseaddr(from_raw)
     disp_name = _decode(disp_name)
@@ -362,24 +516,26 @@ def parse_message(msg: email.message.Message) -> dict | None:
             company = _clean(gd.get("company"))
             break
 
-    # Body extraction: fill in the role (and sometimes company) the subject lacked.
     body = get_body_text(msg)
+    location = ""
     if body:
-        if source == "linkedin" and (not role or not company):
-            lr, lc = _linkedin_body(body)
+        # LinkedIn body is structured: recover role/company/location together.
+        if source == "linkedin" and (not role or not company or not location):
+            lr, lc, ll = _linkedin_fields(body)
             role = role or lr
             company = company or lc
+            location = location or ll
+        # Fill role (and sometimes company) from body patterns when subject lacked it.
         if not role:
             for pat in BODY_PATTERNS:
                 bm = pat.search(body)
                 if not bm:
                     continue
-                bg = bm.groupdict()
-                cand_role = _clean_role(bg.get("role"))
+                cand_role = _clean_role(bm.groupdict().get("role"))
                 if cand_role:
                     role = cand_role
-                    if not company and bg.get("company"):
-                        company = _clean(bg.get("company"))
+                    if not company and bm.groupdict().get("company"):
+                        company = _clean(bm.groupdict().get("company"))
                     break
 
     # Fallback: use sender display name as company (dedicated ATSes send as
@@ -394,24 +550,38 @@ def parse_message(msg: email.message.Message) -> dict | None:
         if cand.lower() not in _PLATFORM_NAMES and len(cand) > 1:
             company = cand
 
-    # Date applied (best effort from the email date).
-    dt = None
+    # Date (best effort from the email date).
     try:
         dt = parsedate_to_datetime(msg.get("Date"))
     except Exception:
         dt = None
-    date_applied = dt.date().isoformat() if dt else ""
+    email_date = dt.date().isoformat() if dt else ""
 
-    parsed = {
+    # Additional fields from the body.
+    if not location and body:
+        location = extract_location(body)
+    status = detect_status(subject, body)
+    message_id = (msg.get("Message-ID") or "").strip()
+
+    return {
         "company": company,
         "role": role,
         "source": source or "other",
-        "date_applied": date_applied,
+        "status": status,
+        "date_applied": email_date,
+        "location": location,
+        "salary": extract_salary(body) if body else "",
+        "recruiter": extract_recruiter(disp_name, sender_email, body),
+        "url": extract_posting_url(body, source or "") if body else "",
+        "email_link": gmail_link(message_id),
+        "message_id": message_id.strip("<>"),
+        "body": body,
         "subject": subject,
         "from": from_raw,
         "sender_email": sender_email,
+        "disp_name": disp_name,
+        "is_person": is_person_sender(disp_name, sender_email),
     }
-    return parsed
 
 
 # ----------------------------- shared ingest -----------------------------
@@ -435,7 +605,8 @@ def ingest_messages(messages, since: date | None = None,
     filtered, e.g. IMAP SEARCH SINCE).
     """
     rows = tracker.load()
-    added = merged = processed = 0
+    recruiter_rows = recruiters.load()
+    added = merged = processed = recruiters_found = 0
     review: list[dict] = []
 
     for msg in messages:
@@ -448,25 +619,37 @@ def ingest_messages(messages, since: date | None = None,
         if not _since_ok(parsed["date_applied"], since):
             continue
 
+        # Auto-seed the recruiters store from human senders.
+        if not dry_run and parsed.get("is_person"):
+            recruiter_rows, r_created = recruiters.seed_from_parsed(parsed, recruiter_rows)
+            recruiters_found += r_created
+
         if not parsed["company"]:
             review.append({k: parsed[k] for k in ("subject", "from", "source", "date_applied")})
             continue
 
+        is_followup = parsed["status"] in tracker.FOLLOWUP_STATUSES
         entry = {
             "company": parsed["company"],
             "role": parsed["role"],
             "source": parsed["source"],
-            "url": "",
+            "status": parsed["status"],
             "date_applied": parsed["date_applied"],
-            "status": "applied",
-            "location": "",
-            "no_travel": "",
+            "last_update": parsed["date_applied"] if is_followup else "",
+            "location": parsed["location"],
+            "salary": parsed["salary"],
+            "recruiter": parsed["recruiter"],
+            "url": parsed["url"],
+            "email_link": parsed["email_link"],
+            "message_id": parsed["message_id"],
+            "body": parsed["body"],
             "source_detail": f"email:{parsed['sender_email']}",
             "notes": f"subject: {parsed['subject']}",
         }
         if dry_run:
             tag = "role" if entry["role"] else "company-only"
-            print(f"  [{tag}] {entry['company']} :: {entry['role'] or '(unknown role)'}  <{parsed['source']}>")
+            print(f"  [{tag}/{parsed['status']}] {entry['company']} :: "
+                  f"{entry['role'] or '(unknown role)'}  <{parsed['source']}>")
             continue
 
         rows, created = tracker.upsert(entry, rows)
@@ -475,10 +658,11 @@ def ingest_messages(messages, since: date | None = None,
 
     if not dry_run:
         tracker.save(rows)
+        recruiters.save(recruiter_rows)
         REVIEW_FILE.write_text(json.dumps(review, indent=2), encoding="utf-8")
 
     stats = {"added": added, "merged": merged, "processed": processed,
-             "review": review, "total": len(rows)}
+             "review": review, "total": len(rows), "recruiters": len(recruiter_rows)}
 
     print("\n" + "=" * 60)
     if dry_run:
@@ -487,6 +671,7 @@ def ingest_messages(messages, since: date | None = None,
     else:
         print(f"Applications added: {added} | merged into existing: {merged}")
         print(f"Total tracked now: {len(rows)}")
+        print(f"Recruiters (human senders) tracked: {len(recruiter_rows)} (+{recruiters_found} new)")
         print(f"Needs review (relevant but unparsed): {len(review)} -> {REVIEW_FILE.name}")
     return stats
 
@@ -533,8 +718,10 @@ def test_connection(since: date, sample: int = 8) -> None:
                 subj = _decode(msg.get("Subject"))
                 print(f"    (not recognized) {subj[:70]}")
                 continue
-            print(f"    {parsed['source']:>10} | {parsed['company'] or '(company?)':30} | "
-                  f"{parsed['role'] or '(role?)':30} | {parsed['date_applied']}")
+            print(f"    {parsed['source']:>10} | {parsed['status']:<11} | "
+                  f"{parsed['company'] or '(company?)':26} | {parsed['role'] or '(role?)':34} | "
+                  f"{parsed['location'] or '-':18} | url={'y' if parsed['url'] else 'n'} "
+                  f"rec={'y' if parsed['recruiter'] else 'n'}")
         print("\nConnection test successful. Run without --test to backfill the tracker.")
     finally:
         try:

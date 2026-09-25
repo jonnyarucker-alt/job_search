@@ -8,9 +8,10 @@ Built as a personal automation project; shared here as a portfolio piece.
 
 1. **Multi-ATS job scraping** - Discovers and pulls open postings from Greenhouse, Lever, Ashby, and Workday job boards, then filters them by role keywords (e.g. technical accounting, external reporting, controller).
 2. **Email backfill** - Detects application-confirmation emails from ATS platforms, LinkedIn, Glassdoor, and recruiters to reconstruct everywhere you have already applied - regardless of the channel you applied through. Read either live over Gmail IMAP (`email_scan.py`) or from a credential-free Google Takeout `.mbox` export (`mbox_scan.py`).
-3. **Central application tracker** - A single source-of-truth store that merges scraped openings, email-detected applications, and manual entries, deduped by company + role.
+3. **Central application tracker** - A single source-of-truth store that merges scraped openings, email-detected applications, and manual entries, with fuzzy same-company/time-window dedup, multi-source aggregation, and automatic status progression (applied -> viewed/reviewed -> interviewing -> offer/rejected) detected from follow-up emails.
 4. **Cross-reference + flagging** - Tags every scraped opening as *already applied* or *not yet applied*, so the output is an actionable shortlist.
-5. **Excel reporting** - Exports an `.xlsx` workbook with an "Open Roles" sheet (not-yet-applied rows highlighted) and a "My Applications" sheet.
+5. **Recruiter tracker** - A separate store of the people you are liaising with, auto-seeded from human email senders plus manual entries.
+6. **Excel reporting** - Exports an `.xlsx` workbook with "Open Roles" (not-yet-applied rows highlighted), "My Applications" (with posting and email hyperlinks), and "Recruiters" sheets.
 
 ```mermaid
 flowchart LR
@@ -39,7 +40,8 @@ scraper/
 ├── job_scraper.py     # Multi-ATS scraper + keyword filter + cross-reference
 ├── email_scan.py      # Gmail IMAP backfill -> application tracker
 ├── mbox_scan.py       # Google Takeout (.mbox) backfill -> application tracker (no credentials)
-├── tracker.py         # Central applications store (load / upsert / dedup / lookup)
+├── tracker.py         # Central applications store (load / upsert / fuzzy dedup / lookup)
+├── recruiters.py      # Recruiter/contact store (auto-seeded + manual)
 ├── export_excel.py    # Excel (.xlsx) report generation
 ├── companies.json     # Target companies + role keywords (config)
 ├── .env.example       # Template for Gmail IMAP credentials
