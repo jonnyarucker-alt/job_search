@@ -1,0 +1,50 @@
+# ==========================================================================
+# PRIVACY BOUNDARY - this repo is PUBLIC (portfolio). Commit CODE ONLY.
+# Everything personal (career data, application history, email content,
+# credentials, generated reports) stays local and is ignored below.
+# ==========================================================================
+
+# --- Credentials / secrets (NEVER commit) ---
+.env
+.env.*
+!.env.example
+secrets*
+*.secret
+*credentials*
+*.pem
+*.key
+
+# --- Personal career vault & applications ---
+career_context/
+applications/
+inputs/
+
+# --- Office / personal documents ---
+*.docx
+*.doc
+*.pdf
+*.xlsx
+*.xls
+~$*
+
+# --- Generated / local data stores (personal) ---
+scraper/data/
+scraper/reports/
+scraper/state.json
+scraper/email_review.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+
+# --- Editor / OS cruft ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

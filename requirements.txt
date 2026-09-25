@@ -1,0 +1,3 @@
+# Job Search Automation Toolkit dependencies.
+# Everything else uses the Python standard library (urllib, imaplib, email, csv, json).
+openpyxl>=3.1
