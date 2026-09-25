@@ -76,13 +76,16 @@ SUBJECT_SIGNALS = [
     "thank you for your application",
     "your application to",
     "your application for",
+    "your application has been",
     "your application was sent",
     "application received",
     "application submitted",
     "we received your application",
     "we've received your application",
     "received your application",
-    "thank you for your interest",
+    "you applied to",
+    "you've applied to",
+    "thank you for your interest in",
 ]
 
 # Ordered subject regexes. Named groups: role, company. First match wins.
@@ -99,6 +102,10 @@ SUBJECT_PATTERNS: list[re.Pattern] = [
     re.compile(r"(?P<role>.+?) at (?P<company>.+?)\s*[-|:]\s*application (?:received|submitted)", re.I),
     # "Your application was sent to <company>"  (LinkedIn)
     re.compile(r"your application was sent to (?P<company>.+)$", re.I),
+    # "You applied to <role> at <company>"  (Indeed)
+    re.compile(r"you(?:'ve| have)? applied (?:to|for) (?P<role>.+?) at (?P<company>.+)$", re.I),
+    # "You applied to <company>"
+    re.compile(r"you(?:'ve| have)? applied to (?P<company>.+)$", re.I),
     # "Your application to <company>"
     re.compile(r"your application to (?P<company>.+)$", re.I),
     # "Thank you for applying to <company>"  /  "Thanks for applying to <company>"
@@ -110,6 +117,13 @@ SUBJECT_PATTERNS: list[re.Pattern] = [
     # "<company> - Thank you for applying"  (Lever style)
     re.compile(r"(?P<company>.+?)\s*[-|:]\s*thank(?:s| you)? for applying", re.I),
 ]
+
+# ATS/aggregator brand names that should never be treated as the employer.
+_PLATFORM_NAMES = {
+    "greenhouse", "lever", "ashby", "workday", "linkedin", "linkedin job alerts",
+    "glassdoor", "glassdoor jobs", "indeed", "indeed apply", "smartrecruiters",
+    "jobvite", "workable", "icims", "teamtailor", "breezy", "recruitee", "wellfound",
+}
 
 # Trailing noise to strip from captured company/role fragments.
 _TRAILERS = re.compile(
@@ -153,34 +167,32 @@ def _imap_date(d: date) -> str:
 def search_uids(imap: imaplib.IMAP4_SSL, since: date) -> list[bytes]:
     """Collect UIDs of candidate emails since `since`.
 
-    Prefer Gmail's X-GM-RAW (one query). Fall back to unioning per-criterion
-    SINCE + FROM / SUBJECT searches on standard IMAP servers.
+    We search by application-confirmation SUBJECT phrases (not by sender domain),
+    because job aggregators send far more alerts/marketing than confirmations, and
+    parse_message requires a confirmation subject anyway.
+
+    Prefer Gmail's X-GM-RAW (one query). Fall back to unioning per-subject SINCE
+    searches on standard IMAP servers.
     """
     uids: set[bytes] = set()
 
-    # Try Gmail raw search first.
-    domain_q = " OR ".join(f"from:{d}" for d in sorted(set(SENDER_DOMAINS)))
+    # Try Gmail raw search first: subject signals only. The whole query is sent as
+    # an IMAP quoted-string, so internal phrase quotes must be backslash-escaped.
     subject_q = " OR ".join(f'subject:"{s}"' for s in SUBJECT_SIGNALS)
-    raw = f'after:{since.strftime("%Y/%m/%d")} ({domain_q} OR {subject_q})'
+    raw = f'after:{since.strftime("%Y/%m/%d")} ({subject_q})'
+    escaped = raw.replace("\\", "\\\\").replace('"', '\\"')
     try:
-        typ, data = imap.uid("SEARCH", "X-GM-RAW", f'"{raw}"')
+        typ, data = imap.uid("SEARCH", "X-GM-RAW", f'"{escaped}"')
         if typ == "OK" and data and data[0]:
             return data[0].split()
     except imaplib.IMAP4.error:
         pass
 
-    # Fallback: standard IMAP, unioned.
+    # Fallback: standard IMAP, unioned per subject phrase (phrase must be quoted).
     since_str = _imap_date(since)
-    for dom in sorted(set(SENDER_DOMAINS)):
-        try:
-            typ, data = imap.uid("SEARCH", None, "SINCE", since_str, "FROM", dom)
-            if typ == "OK" and data and data[0]:
-                uids.update(data[0].split())
-        except imaplib.IMAP4.error:
-            continue
     for sig in SUBJECT_SIGNALS:
         try:
-            typ, data = imap.uid("SEARCH", None, "SINCE", since_str, "SUBJECT", sig)
+            typ, data = imap.uid("SEARCH", None, "SINCE", since_str, "SUBJECT", f'"{sig}"')
             if typ == "OK" and data and data[0]:
                 uids.update(data[0].split())
         except imaplib.IMAP4.error:
@@ -237,8 +249,10 @@ def parse_message(msg: email.message.Message) -> dict | None:
     source = source_from_sender(sender_email)
     subj_signal = any(sig in subject.lower() for sig in SUBJECT_SIGNALS)
 
-    # Not from a known ATS/job domain AND no confirmation-signal subject -> skip.
-    if source is None and not subj_signal:
+    # Require an actual application-confirmation phrase in the subject. Being merely
+    # *from* a job domain (indeed/glassdoor/linkedin) is not enough - those send
+    # floods of job alerts/marketing. This is the main noise filter.
+    if not subj_signal:
         return None
 
     role, company = "", ""
@@ -250,14 +264,16 @@ def parse_message(msg: email.message.Message) -> dict | None:
             company = _clean(gd.get("company"))
             break
 
-    # Fallback: use sender display name as company (Greenhouse/Lever send as "<Company> <no-reply@...>").
-    if not company and disp_name and "@" not in disp_name:
-        cand = _clean(re.sub(r"\b(careers?|recruiting|talent|hiring|team|no[- ]?reply)\b", "",
-                             disp_name, flags=re.I))
-        # Avoid using the ATS platform's own name as the company.
-        if cand.lower() not in {"greenhouse", "lever", "ashby", "workday", "linkedin",
-                                "glassdoor", "indeed", "smartrecruiters", "jobvite",
-                                "workable", "icims"} and len(cand) > 1:
+    # Fallback: use sender display name as company (dedicated ATSes send as
+    # "<Company> <no-reply@greenhouse.io>"). Do NOT do this for aggregators
+    # (indeed/glassdoor/linkedin), whose display name is the platform, not the employer.
+    if not company and source not in {"indeed", "glassdoor", "linkedin"} \
+            and disp_name and "@" not in disp_name:
+        cand = _clean(re.sub(
+            r"\b(careers?|recruiting|talent|acquisition|hiring|team|jobs?|apply|"
+            r"notifications?|no[- ]?reply|do[- ]?not[- ]?reply)\b", "",
+            disp_name, flags=re.I))
+        if cand.lower() not in _PLATFORM_NAMES and len(cand) > 1:
             company = cand
 
     # Date applied (best effort from the email date).
@@ -366,16 +382,55 @@ def _imap_messages(imap: imaplib.IMAP4_SSL, uids: list[bytes]):
             yield msg
 
 
+def _select_folder(imap: imaplib.IMAP4_SSL, env: dict) -> str:
+    folder = env.get("IMAP_FOLDER", DEFAULT_FOLDER)
+    typ, _ = imap.select(f'"{folder}"', readonly=True)
+    if typ != "OK":
+        imap.select("INBOX", readonly=True)
+        folder = "INBOX"
+    return folder
+
+
+def test_connection(since: date, sample: int = 8) -> None:
+    """Log in, confirm access, and report how many application emails are visible.
+    Writes nothing. Good for validating a freshly created app password."""
+    env = load_env()
+    print(f"Connecting to {env.get('IMAP_HOST', DEFAULT_HOST)} as {env.get('GMAIL_ADDRESS')} ...")
+    imap = connect(env)
+    try:
+        folder = _select_folder(imap, env)
+        print(f"  Login OK. Reading folder: {folder}")
+        uids = search_uids(imap, since)
+        print(f"  Found {len(uids)} candidate application emails since {since.isoformat()}.")
+        if not uids:
+            print("  (Nothing matched. Try an earlier --since date, e.g. --since 2022-01-01.)")
+            return
+        print(f"\n  Sample of the {min(sample, len(uids))} most recent matches:")
+        for uid in uids[-sample:]:
+            msg = fetch_headers(imap, uid)
+            if msg is None:
+                continue
+            parsed = parse_message(msg)
+            if parsed is None:
+                subj = _decode(msg.get("Subject"))
+                print(f"    (not recognized) {subj[:70]}")
+                continue
+            print(f"    {parsed['source']:>10} | {parsed['company'] or '(company?)':30} | "
+                  f"{parsed['role'] or '(role?)':30} | {parsed['date_applied']}")
+        print("\nConnection test successful. Run without --test to backfill the tracker.")
+    finally:
+        try:
+            imap.close()
+        except Exception:
+            pass
+        imap.logout()
+
+
 def run(since: date, dry_run: bool, limit: int | None) -> None:
     env = load_env()
     imap = connect(env)
-    folder = env.get("IMAP_FOLDER", DEFAULT_FOLDER)
     try:
-        typ, _ = imap.select(f'"{folder}"', readonly=True)
-        if typ != "OK":
-            imap.select("INBOX", readonly=True)
-            folder = "INBOX"
-
+        folder = _select_folder(imap, env)
         uids = search_uids(imap, since)
         if limit:
             uids = uids[-limit:]
@@ -395,6 +450,7 @@ def main():
     ap = argparse.ArgumentParser(description="Backfill application history from Gmail via IMAP.")
     ap.add_argument("--since", help="start date YYYY-MM-DD (default: 24 months ago)")
     ap.add_argument("--dry-run", action="store_true", help="parse and print, don't write the tracker")
+    ap.add_argument("--test", action="store_true", help="just verify login + show a sample; write nothing")
     ap.add_argument("--limit", type=int, help="cap messages processed (for testing)")
     args = ap.parse_args()
 
@@ -402,6 +458,10 @@ def main():
         since = datetime.strptime(args.since, "%Y-%m-%d").date()
     else:
         since = date.today() - timedelta(days=730)
+
+    if args.test:
+        test_connection(since)
+        return
 
     run(since, args.dry_run, args.limit)
 
