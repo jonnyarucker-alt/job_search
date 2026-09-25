@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import email
+import html as _html
 import imaplib
 import json
 import re
@@ -125,9 +126,95 @@ _PLATFORM_NAMES = {
     "jobvite", "workable", "icims", "teamtailor", "breezy", "recruitee", "wellfound",
 }
 
+# Body regexes for pulling the ROLE (and sometimes company) out of the email body,
+# used when the subject alone doesn't carry the title. Ordered; first match wins.
+BODY_PATTERNS: list[re.Pattern] = [
+    # SmartRecruiters/other: "Your application for the <role> job was submitted"
+    re.compile(r"application for the (?P<role>.+?) (?:job|role|position) was submitted", re.I),
+    # Ashby: "applying for the <role> role at <company>"
+    re.compile(r"apply(?:ing)? (?:to|for) the (?P<role>.+?) (?:role|position|job) at (?P<company>[^.!\n]+)", re.I),
+    # Greenhouse/Ashby: "applying to the <role> role"
+    re.compile(r"apply(?:ing)? (?:to|for) the (?P<role>.+?) (?:role|position|job)\b", re.I),
+    # "received your application for the <role> and/at/,."
+    re.compile(r"received your application for the (?P<role>.+?)(?: and | at |[,.\n])", re.I),
+    # Workday-in-body: "received your application for <role> at <company>"
+    re.compile(r"received your application for (?P<role>.+?) at (?P<company>[^,.!\n]+)(?:[,.\n]| and )", re.I),
+    # Lever: "received your application for <role>, and ..."
+    re.compile(r"received your application for (?P<role>.+?)(?:,? and |[.\n])", re.I),
+    # Generic: "your application for <role> (at <company>)?"
+    re.compile(r"your application for (?P<role>.+?)(?: at (?P<company>[^,.!\n]+))?(?:,? and |[.\n])", re.I),
+]
+
 # Trailing noise to strip from captured company/role fragments.
 _TRAILERS = re.compile(
     r"\s*[-|:•·]+\s*(application|careers?|jobs?|recruiting|talent|hiring).*$", re.I)
+
+
+def _strip_html(h: str) -> str:
+    h = re.sub(r"(?is)<(style|script|head)[^>]*>.*?</\1>", " ", h)
+    h = re.sub(r"(?s)<[^>]+>", " ", h)
+    return _html.unescape(h)
+
+
+def _normalize_ws(t: str) -> str:
+    t = _html.unescape(t)
+    t = t.replace("\r", "")
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n[ \t]*\n+", "\n", t)
+    return t.strip()
+
+
+def get_body_text(msg: email.message.Message) -> str:
+    """Return decoded body text (prefers text/plain, falls back to stripped HTML)."""
+    plain = html_body = ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_maintype() == "multipart":
+                continue
+            if "attachment" in str(part.get("Content-Disposition") or "").lower():
+                continue
+            payload = part.get_payload(decode=True)
+            if payload is None:
+                continue
+            try:
+                text = payload.decode(part.get_content_charset() or "utf-8", "replace")
+            except Exception:
+                continue
+            ct = part.get_content_type()
+            if ct == "text/plain" and not plain:
+                plain = text
+            elif ct == "text/html" and not html_body:
+                html_body = text
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload is not None:
+            try:
+                plain = payload.decode(msg.get_content_charset() or "utf-8", "replace")
+            except Exception:
+                plain = ""
+
+    text = plain if plain.strip() else _strip_html(html_body)
+    # A "text/plain" part that is really HTML (has tags) still needs stripping.
+    if "</" in text and re.search(r"<[a-z]+[^>]*>", text, re.I):
+        text = _strip_html(text)
+    return _normalize_ws(text)
+
+
+def _clean_role(text: str | None) -> str:
+    r = _clean(text)
+    r = re.sub(r"\s+(role|position|job)$", "", r, flags=re.I).strip()
+    return r if 1 < len(r) <= 70 else ""
+
+
+def _linkedin_body(body: str) -> tuple[str, str]:
+    """LinkedIn 'application sent' emails: '<company>\\n<role>\\n<company>\\n<location>'."""
+    m = re.search(r"your application was sent to (?P<company>.+)", body, re.I)
+    if not m:
+        return "", ""
+    company = _clean(m.group("company"))
+    lines = [ln.strip() for ln in body[m.end():].splitlines() if ln.strip()]
+    role = _clean_role(lines[0]) if lines else ""
+    return role, company
 
 
 # ----------------------------- env / connect -----------------------------
@@ -210,6 +297,17 @@ def fetch_headers(imap: imaplib.IMAP4_SSL, uid: bytes) -> email.message.Message 
     return email.message_from_bytes(raw)
 
 
+def fetch_message(imap: imaplib.IMAP4_SSL, uid: bytes) -> email.message.Message | None:
+    """Fetch the full message (headers + body) so role extraction can read the body."""
+    typ, data = imap.uid("FETCH", uid, "(BODY.PEEK[])")
+    if typ != "OK" or not data or not data[0]:
+        return None
+    raw = data[0][1]
+    if not isinstance(raw, (bytes, bytearray)):
+        return None
+    return email.message_from_bytes(raw)
+
+
 # ----------------------------- parse -----------------------------
 
 def _decode(s: str | None) -> str:
@@ -227,7 +325,7 @@ def _clean(fragment: str | None) -> str:
     frag = fragment.strip().strip('"').strip()
     frag = _TRAILERS.sub("", frag)
     frag = frag.strip(" .!-|:•·")
-    # Drop obvious non-company tails like "our team", "us"
+    frag = re.sub(r"\s+", " ", frag)
     return frag.strip()
 
 
@@ -260,9 +358,29 @@ def parse_message(msg: email.message.Message) -> dict | None:
         m = pat.search(subject)
         if m:
             gd = m.groupdict()
-            role = _clean(gd.get("role"))
+            role = _clean_role(gd.get("role"))
             company = _clean(gd.get("company"))
             break
+
+    # Body extraction: fill in the role (and sometimes company) the subject lacked.
+    body = get_body_text(msg)
+    if body:
+        if source == "linkedin" and (not role or not company):
+            lr, lc = _linkedin_body(body)
+            role = role or lr
+            company = company or lc
+        if not role:
+            for pat in BODY_PATTERNS:
+                bm = pat.search(body)
+                if not bm:
+                    continue
+                bg = bm.groupdict()
+                cand_role = _clean_role(bg.get("role"))
+                if cand_role:
+                    role = cand_role
+                    if not company and bg.get("company"):
+                        company = _clean(bg.get("company"))
+                    break
 
     # Fallback: use sender display name as company (dedicated ATSes send as
     # "<Company> <no-reply@greenhouse.io>"). Do NOT do this for aggregators
@@ -377,7 +495,7 @@ def ingest_messages(messages, since: date | None = None,
 
 def _imap_messages(imap: imaplib.IMAP4_SSL, uids: list[bytes]):
     for uid in uids:
-        msg = fetch_headers(imap, uid)
+        msg = fetch_message(imap, uid)
         if msg is not None:
             yield msg
 
@@ -407,7 +525,7 @@ def test_connection(since: date, sample: int = 8) -> None:
             return
         print(f"\n  Sample of the {min(sample, len(uids))} most recent matches:")
         for uid in uids[-sample:]:
-            msg = fetch_headers(imap, uid)
+            msg = fetch_message(imap, uid)
             if msg is None:
                 continue
             parsed = parse_message(msg)
